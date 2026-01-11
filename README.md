@@ -2,7 +2,5 @@
 
 
 This demonstrates the user of some really basic langgraph "agents".  
-# Evolution
-- working_uber_simple.py
-- more_modern_simple.py
-- midlevel_writing_assistant.py
+
+I have yet to clean things up, 11_test_mode_w_multi.py is the one you want.
