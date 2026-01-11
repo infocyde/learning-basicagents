@@ -1,0 +1,705 @@
+"""
+Advanced LangGraph Writing Assistant with Multi-Agent Workflow
+
+Enhanced Features:
+- Error handling with retries
+- Streaming output with continuation for long responses
+- Three agents: Outliner → Writer → Editor
+- Typed state with Pydantic
+- Configurable LLM settings
+- Progress callbacks
+- File system I/O for intermediate and final outputs
+- Job ID tracking for file organization
+- Interactive prompting when run in IDE
+"""
+
+import os
+import sys
+import uuid
+from pathlib import Path
+from datetime import datetime
+from typing import Annotated
+from pydantic import BaseModel, Field
+from langgraph.graph import StateGraph, END, START
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from openai import RateLimitError, APIError
+
+
+load_dotenv()
+
+# =============================================================================
+# Clear out previous run results/errors from terminal
+# =============================================================================
+
+os.system("cls" if os.name == "nt" else "clear")
+
+
+# =============================================================================
+# Directory Configuration
+# =============================================================================
+
+WORKING_DIR = Path("/working")
+OUTPUT_DIR = Path("/output")
+
+# Create directories if they don't exist
+WORKING_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# =============================================================================
+# Job ID Management
+# =============================================================================
+
+def generate_job_id() -> str:
+    """Generate a unique job ID for this run."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    short_uuid = uuid.uuid4().hex[:8]
+    return f"{timestamp}_{short_uuid}"
+
+
+# Global job ID - set at runtime
+JOB_ID: str = ""
+
+
+# =============================================================================
+# File System Utilities
+# =============================================================================
+
+def get_working_filepath(agent_name: str) -> Path:
+    """Get the filepath for an agent's output in the working directory."""
+    return WORKING_DIR / f"{JOB_ID}_{agent_name}.txt"
+
+
+def get_output_filepath(filename: str) -> Path:
+    """Get the filepath for final output."""
+    return OUTPUT_DIR / f"{JOB_ID}_{filename}"
+
+
+def save_to_working(agent_name: str, content: str) -> Path:
+    """
+    Save content to the working directory.
+    
+    Args:
+        agent_name: Name of the agent (used in filename)
+        content: Content to save
+        
+    Returns:
+        Path to the saved file
+    """
+    filepath = get_working_filepath(agent_name)
+    filepath.write_text(content, encoding="utf-8")
+    print(f"   💾 Saved to: {filepath}")
+    return filepath
+
+
+def load_from_working(agent_name: str) -> str:
+    """
+    Load content from the working directory.
+    
+    Args:
+        agent_name: Name of the agent whose output to load
+        
+    Returns:
+        Content from the file, or empty string if not found
+    """
+    filepath = get_working_filepath(agent_name)
+    if filepath.exists():
+        return filepath.read_text(encoding="utf-8")
+    return ""
+
+
+def save_final_output(content: str, filename: str = "final_article.txt") -> Path:
+    """
+    Save final output to the output directory.
+    
+    Args:
+        content: Content to save
+        filename: Output filename
+        
+    Returns:
+        Path to the saved file
+    """
+    filepath = get_output_filepath(filename)
+    filepath.write_text(content, encoding="utf-8")
+    return filepath
+
+
+def append_to_file(filepath: Path, content: str) -> None:
+    """Append content to an existing file."""
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(content)
+
+
+# =============================================================================
+# State Definition (using Pydantic for validation)
+# =============================================================================
+
+class WritingState(BaseModel):
+    """State that flows through the writing pipeline."""
+    job_id: str = Field(default="", description="Unique job identifier")
+    topic: str = Field(description="The topic to write about")
+    outline: str = Field(default="", description="Generated outline")
+    draft: str = Field(default="", description="First draft from writer")
+    final_draft: str = Field(default="", description="Edited final version")
+    revision_notes: str = Field(default="", description="Editor's revision notes")
+    error: str | None = Field(default=None, description="Error message if something failed")
+    
+    class Config:
+        # Allow mutation for state updates
+        frozen = False
+
+
+# =============================================================================
+# LLM Configuration
+# =============================================================================
+
+def create_llm(
+    model: str = "gpt-4o-mini",
+    temperature: float = 0.7,
+    streaming: bool = True,
+    max_tokens: int = 4096
+) -> ChatOpenAI:
+    """Create a configured LLM instance."""
+    return ChatOpenAI(
+        model=model,
+        temperature=temperature,
+        streaming=streaming,
+        max_tokens=max_tokens,
+    )
+
+
+# Default LLM - can be overridden
+llm = create_llm()
+
+
+# =============================================================================
+# Continuation Logic for Long Responses
+# =============================================================================
+
+def stream_with_continuation(
+    messages: list,
+    max_continuations: int = 5,
+    continuation_prompt: str = "Continue from where you left off. Do not repeat what you've already written."
+) -> tuple[str, str]:
+    """
+    Stream LLM response with automatic continuation if response is truncated.
+    
+    Args:
+        messages: Initial messages to send
+        max_continuations: Maximum number of continuation calls
+        continuation_prompt: Prompt to use for continuations
+        
+    Returns:
+        Tuple of (full_response, finish_reason)
+    """
+    full_response = ""
+    finish_reason = "unknown"
+    conversation = list(messages)  # Copy to avoid mutation
+    
+    for iteration in range(max_continuations + 1):
+        chunk_text = ""
+        current_finish_reason = None
+        
+        # Stream the response
+        for chunk in llm.stream(conversation):
+            if chunk.content:
+                chunk_text += chunk.content
+                print(".", end="", flush=True)
+            
+            # Try to get finish reason from chunk metadata
+            if hasattr(chunk, 'response_metadata'):
+                metadata = chunk.response_metadata
+                if isinstance(metadata, dict) and 'finish_reason' in metadata:
+                    current_finish_reason = metadata['finish_reason']
+        
+        full_response += chunk_text
+        
+        # Check if we got a complete response
+        # OpenAI returns 'stop' when complete, 'length' when truncated
+        if current_finish_reason:
+            finish_reason = current_finish_reason
+        
+        # Heuristic checks for incomplete response
+        response_seems_incomplete = (
+            finish_reason == "length" or
+            chunk_text.rstrip().endswith(("...", "—", "-", ",")) or
+            (len(chunk_text) > 100 and not chunk_text.rstrip().endswith((".", "!", "?", '"', "'")))
+        )
+        
+        if not response_seems_incomplete:
+            # Response appears complete
+            break
+        
+        if iteration < max_continuations:
+            print(f"\n   🔄 Response may be incomplete, continuing (attempt {iteration + 2})...", end="", flush=True)
+            
+            # Add the partial response and continuation request to conversation
+            conversation.append(AIMessage(content=chunk_text))
+            conversation.append(HumanMessage(content=continuation_prompt))
+        else:
+            print(f"\n   ⚠️  Max continuations reached")
+    
+    return full_response, finish_reason
+
+
+# =============================================================================
+# Retry Decorator for API Resilience
+# =============================================================================
+
+def with_retries(func):
+    """Decorator that adds retry logic for transient API failures."""
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((RateLimitError, APIError)),
+        before_sleep=lambda retry_state: print(
+            f"  ⚠️  API error, retrying in {retry_state.next_action.sleep} seconds..."
+        )
+    )
+    def wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+    return wrapper
+
+
+# =============================================================================
+# Agent Definitions
+# =============================================================================
+
+@with_retries
+def outline_agent(state: WritingState) -> dict:
+    """
+    Creates a structured outline from the topic.
+    
+    Returns only the fields being updated (LangGraph merges them).
+    """
+    print("\n📋 OUTLINE AGENT")
+    print(f"   Job ID: {JOB_ID}")
+    print(f"   Topic: {state.topic}")
+    print("   Working...", end="", flush=True)
+    
+    try:
+        messages = [
+            SystemMessage(content="""You are an expert outline creator. 
+Create a clear, hierarchical outline with:
+- A compelling title
+- 5-7 main sections with Roman numerals
+- 3-4 subsections under each main section
+- Brief notes on key points to cover
+- Estimated word count targets for each section
+
+Keep the outline focused and well-organized. This outline will be used to write a comprehensive, long-form article."""),
+            HumanMessage(content=f"Create a detailed outline for a comprehensive article about: {state.topic}")
+        ]
+        
+        # Stream with continuation support
+        full_response, finish_reason = stream_with_continuation(messages)
+        
+        print(" Done!")
+        print(f"   📄 Outline length: {len(full_response)} chars")
+        print(f"   🏁 Finish reason: {finish_reason}")
+        
+        # Save to working directory
+        save_to_working("outline", full_response)
+        
+        return {"outline": full_response}
+    
+    except Exception as e:
+        print(f" Failed: {e}")
+        return {"error": f"Outline agent failed: {str(e)}"}
+
+
+@with_retries
+def writing_agent(state: WritingState) -> dict:
+    """
+    Writes a first draft based on the outline.
+    Uses continuation for long articles.
+    """
+    # Skip if previous agent errored
+    if state.error:
+        return {}
+    
+    print("\n✍️  WRITING AGENT")
+    print(f"   Job ID: {JOB_ID}")
+    print(f"   Using outline ({len(state.outline)} chars)")
+    print("   Writing...", end="", flush=True)
+    
+    try:
+        messages = [
+            SystemMessage(content="""You are an expert long-form writer. 
+Write a comprehensive, well-structured article based on the provided outline.
+
+Guidelines:
+- Follow the outline structure closely
+- Use clear, engaging prose with smooth transitions
+- Include relevant examples and explanations
+- Aim for 1500-2500 words total
+- Write in a professional but accessible tone
+- Complete all sections - do not truncate or summarize
+- If you run out of space, end at a natural paragraph break so you can continue"""),
+            HumanMessage(content=f"Write a comprehensive article based on this outline:\n\n{state.outline}")
+        ]
+        
+        # Stream with continuation support for long articles
+        full_response, finish_reason = stream_with_continuation(
+            messages, 
+            max_continuations=8,
+            continuation_prompt="Continue writing the article from exactly where you stopped. Do not repeat any content. Pick up mid-section if needed."
+        )
+        
+        print(" Done!")
+        word_count = len(full_response.split())
+        print(f"   📝 Draft length: {word_count} words")
+        print(f"   🏁 Finish reason: {finish_reason}")
+        
+        # Save to working directory
+        save_to_working("draft", full_response)
+        
+        return {"draft": full_response}
+    
+    except Exception as e:
+        print(f" Failed: {e}")
+        return {"error": f"Writing agent failed: {str(e)}"}
+
+
+@with_retries  
+def editor_agent(state: WritingState) -> dict:
+    """
+    Reviews and improves the draft.
+    Handles long articles with continuation.
+    """
+    if state.error:
+        return {}
+    
+    word_count = len(state.draft.split())
+    print("\n🔍 EDITOR AGENT")
+    print(f"   Job ID: {JOB_ID}")
+    print(f"   Reviewing draft ({word_count} words)")
+    print("   Editing...", end="", flush=True)
+    
+    try:
+        messages = [
+            SystemMessage(content="""You are an expert editor working on long-form content.
+Review and improve the draft article comprehensively.
+
+Your tasks:
+1. Fix any grammatical or spelling errors
+2. Improve clarity and flow throughout
+3. Strengthen weak sentences and transitions
+4. Ensure consistent tone and style
+5. Enhance readability without changing the meaning
+6. Preserve the full length - do not truncate or summarize
+7. At the very end, add a "---REVISION NOTES---" section listing your key changes
+
+Return the COMPLETE improved article followed by your revision notes.
+If the article is long, maintain its full length in your edited version."""),
+            HumanMessage(content=f"Edit and improve this draft (preserve full length):\n\n{state.draft}")
+        ]
+        
+        # Stream with continuation support
+        full_response, finish_reason = stream_with_continuation(
+            messages,
+            max_continuations=8,
+            continuation_prompt="Continue the edited article from exactly where you stopped. Do not repeat content. Complete all remaining sections and then add the revision notes at the end."
+        )
+        
+        print(" Done!")
+        print(f"   🏁 Finish reason: {finish_reason}")
+        
+        # Try to separate revision notes if present
+        if "---REVISION NOTES---" in full_response:
+            parts = full_response.split("---REVISION NOTES---", 1)
+            final_draft = parts[0].strip()
+            revision_notes = "REVISION NOTES\n" + parts[1].strip() if len(parts) > 1 else ""
+        elif "Revision Notes" in full_response:
+            parts = full_response.split("Revision Notes", 1)
+            final_draft = parts[0].strip()
+            revision_notes = "Revision Notes" + parts[1] if len(parts) > 1 else ""
+        else:
+            final_draft = full_response
+            revision_notes = ""
+        
+        final_word_count = len(final_draft.split())
+        print(f"   📝 Final draft: {final_word_count} words")
+        
+        # Save to working directory
+        save_to_working("editor_output", full_response)
+        save_to_working("final_draft", final_draft)
+        if revision_notes:
+            save_to_working("revision_notes", revision_notes)
+        
+        return {
+            "final_draft": final_draft,
+            "revision_notes": revision_notes
+        }
+    
+    except Exception as e:
+        print(f" Failed: {e}")
+        return {"error": f"Editor agent failed: {str(e)}"}
+
+
+# =============================================================================
+# Conditional Edge (example: skip editor if draft is short)
+# =============================================================================
+
+def should_edit(state: WritingState) -> str:
+    """Decide whether to run the editor or go straight to END."""
+    if state.error:
+        return "end"
+    
+    # Example condition: skip editing for very short drafts
+    word_count = len(state.draft.split())
+    if word_count < 50:
+        print("\n⏭️  Skipping editor (draft too short)")
+        return "end"
+    
+    return "editor"
+
+
+# =============================================================================
+# Build the Graph
+# =============================================================================
+
+def create_workflow() -> StateGraph:
+    """Build and compile the writing workflow graph."""
+    
+    # Create graph with Pydantic state
+    workflow = StateGraph(WritingState)
+    
+    # Add nodes
+    workflow.add_node("outline", outline_agent)
+    workflow.add_node("writer", writing_agent)
+    workflow.add_node("editor", editor_agent)
+    
+    # Add edges
+    workflow.add_edge(START, "outline")
+    workflow.add_edge("outline", "writer")
+    
+    # Conditional edge: writer → editor OR end
+    workflow.add_conditional_edges(
+        "writer",
+        should_edit,
+        {
+            "editor": "editor",
+            "end": END
+        }
+    )
+    
+    workflow.add_edge("editor", END)
+    
+    return workflow.compile()
+
+
+# =============================================================================
+# Interactive Mode Detection
+# =============================================================================
+
+def is_interactive_mode() -> bool:
+    """
+    Detect if the script is running in an interactive environment (IDE).
+    
+    Returns True if:
+    - Running in an IDE (PyCharm, VS Code, etc.)
+    - Running in an interactive Python shell
+    - stdin is a terminal
+    """
+    # Check for common IDE indicators
+    ide_indicators = [
+        "PYCHARM_HOSTED" in os.environ,
+        "VSCODE_PID" in os.environ,
+        "TERM_PROGRAM" in os.environ and "vscode" in os.environ.get("TERM_PROGRAM", "").lower(),
+        "JUPYTER_RUNTIME_DIR" in os.environ,
+        "JPY_PARENT_PID" in os.environ,
+        "SPYDER" in os.environ,
+    ]
+    
+    if any(ide_indicators):
+        return True
+    
+    # Check if running interactively (no command line args and stdin is a terminal)
+    try:
+        if len(sys.argv) <= 1 and sys.stdin.isatty():
+            return True
+    except:
+        pass
+    
+    return False
+
+
+def get_topic_interactively() -> str:
+    """Prompt the user for a topic interactively."""
+    print("\n" + "=" * 60)
+    print("📝 WRITING ASSISTANT - Interactive Mode")
+    print("=" * 60)
+    print("\nEnter the topic you'd like to write about.")
+    print("(Press Enter for default topic)\n")
+    
+    default_topic = "The Future of Artificial Intelligence in Healthcare: Opportunities, Challenges, and Ethical Considerations"
+    
+    try:
+        user_input = input(f"Topic [{default_topic[:50]}...]: ").strip()
+        return user_input if user_input else default_topic
+    except (EOFError, KeyboardInterrupt):
+        print("\nUsing default topic...")
+        return default_topic
+
+
+# =============================================================================
+# Main Execution
+# =============================================================================
+
+def run_writing_assistant(
+    topic: str,
+    model: str = "gpt-4o-mini",
+    temperature: float = 0.7,
+    max_tokens: int = 4096
+) -> dict:
+    """
+    Run the complete writing assistant pipeline.
+    
+    Args:
+        topic: The topic to write about
+        model: OpenAI model to use
+        temperature: Creativity level (0-1)
+        max_tokens: Maximum tokens per LLM call
+    
+    Returns:
+        Dict with all generated content (topic, outline, draft, final_draft, etc.)
+    """
+    global llm, JOB_ID
+    
+    # Generate unique job ID for this run
+    JOB_ID = generate_job_id()
+    
+    llm = create_llm(model=model, temperature=temperature, max_tokens=max_tokens)
+    
+    print("=" * 60)
+    print("🚀 WRITING ASSISTANT STARTING")
+    print("=" * 60)
+    print(f"Job ID: {JOB_ID}")
+    print(f"Model: {model}")
+    print(f"Temperature: {temperature}")
+    print(f"Max Tokens: {max_tokens}")
+    print(f"Working Dir: {WORKING_DIR}")
+    print(f"Output Dir: {OUTPUT_DIR}")
+    print(f"Topic: {topic}")
+    
+    # Create initial state
+    initial_state = WritingState(topic=topic, job_id=JOB_ID)
+    
+    # Save initial state info
+    job_info = f"""Job ID: {JOB_ID}
+Started: {datetime.now().isoformat()}
+Model: {model}
+Temperature: {temperature}
+Topic: {topic}
+"""
+    save_to_working("job_info", job_info)
+    
+    # Build and run workflow
+    app = create_workflow()
+    
+    # Run workflow
+    final_state = app.invoke(initial_state)
+    
+    return final_state
+
+
+def main():
+    """CLI entry point."""
+    # Check for API key
+    if not os.getenv("OPENAI_API_KEY"):
+        print("❌ Error: OPENAI_API_KEY not found in environment")
+        print("   Set it in a .env file or export it directly")
+        sys.exit(1)
+    
+    # Determine topic based on run mode
+    if is_interactive_mode():
+        topic = get_topic_interactively()
+    elif len(sys.argv) > 1:
+        topic = " ".join(sys.argv[1:])
+    else:
+        topic = "The Future of Artificial Intelligence in Healthcare: Opportunities, Challenges, and Ethical Considerations"
+    
+    try:
+        result = run_writing_assistant(
+            topic=topic,
+            model="gpt-4o-mini",  # Use "gpt-4o" for better quality
+            temperature=0.7,
+            max_tokens=4096
+        )
+        
+        # Output results
+        print("\n" + "=" * 60)
+        print("✅ COMPLETE!")
+        print("=" * 60)
+        
+        if result.get("error"):
+            print(f"\n❌ Error occurred: {result['error']}")
+            
+            # Save error info
+            error_path = save_final_output(
+                f"Error: {result['error']}\n\nPartial results may be in working directory.",
+                "error.txt"
+            )
+            print(f"   Error log saved to: {error_path}")
+        else:
+            # Get the final content
+            final_content = result.get("final_draft") or result.get("draft", "")
+            revision_notes = result.get("revision_notes", "")
+            
+            # Print to screen
+            print(f"\n📄 FINAL ARTICLE ({len(final_content.split())} words):")
+            print("-" * 40)
+            print(final_content)
+            
+            if revision_notes:
+                print("\n" + "-" * 40)
+                print(revision_notes)
+            
+            # Save to output directory
+            full_output = f"""Topic: {result.get('topic', topic)}
+Job ID: {JOB_ID}
+Generated: {datetime.now().isoformat()}
+
+{'=' * 60}
+FINAL ARTICLE
+{'=' * 60}
+
+{final_content}
+
+"""
+            if revision_notes:
+                full_output += f"""
+{'=' * 60}
+{revision_notes}
+"""
+            
+            output_path = save_final_output(full_output, "final_article.txt")
+            print(f"\n   📁 Output saved to: {output_path}")
+            
+            # Also save just the article without metadata
+            clean_output_path = save_final_output(final_content, "article_clean.txt")
+            print(f"   📁 Clean article saved to: {clean_output_path}")
+            
+            # Print summary of all files
+            print(f"\n📂 Working files in {WORKING_DIR}:")
+            for f in sorted(WORKING_DIR.glob(f"{JOB_ID}_*")):
+                print(f"   - {f.name}")
+        
+        return result
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Interrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
+if __name__ == "__main__":
+    main()
