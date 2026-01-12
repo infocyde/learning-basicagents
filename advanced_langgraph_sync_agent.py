@@ -31,28 +31,30 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from openai import RateLimitError, APIError
-from tavily import TavilyClient
-from ddgs import DDGS
+from tavily import TavilyClient  # API client for Tavily web search which uses Bing under the hood and is optimized for LLMs
+from ddgs import DDGS # free unofficial DuckDuckGo Search API, brings back list of urls to be used with Trafilatura
+import trafilatura # Web page content extraction library 
 
+# Load environment variables from a .env file if present in a directory tree parent to this script
+load_dotenv() 
 
-load_dotenv()
-
-# =============================================================================
-# Hard Coded Variables Configuration
-# =============================================================================
-# When TEST_MODE is True, uses free DuckDuckGo search instead of Tavily API
-# Useful for development/testing without consuming Tavily API credits
-TEST_MODE = True  # Set to True to use DDGS instead of Tavily
-llm_model = "gpt-5-mini"  # Default LLM model to use
-
-# =============================================================================
 # Clear out previous run results/errors from terminal
-# =============================================================================
-
 os.system("cls" if os.name == "nt" else "clear")
 
 
+# =============================================================================
+# This the base of a SYNCOUS multi-agent writing assistant with advanced features
+# =============================================================================
+# also expects OpenAI API key in environment for LLM calls
+# and optionally a TAVILY_API_KEY for Tavily usage, to use TAVILY you need to sign up for an API key at https://tavily.com and set TEST_MODE to False below
 
+
+# Note, both tarfilatura and Tavily do not support headless browsing with JavaScript rendering for modern web pages. A problem for both.
+# When TEST_MODE is True, uses free DuckDuckGo search + trafilatura instead of Tavily API
+# you abuse duckduckgo you may get blocked temporarily. So use responsibly.
+# both ddgs and trafilatura have a get images option but since this is a text only agent we disable image downloading since without vision capabilities they are not useful.
+# some of the new smaller LLMs are now vision, so there could be another subagent, maybe even an async one, that swaps images out with what it sees in the image
+# god level (little g there is only one God) would be to have an agent that does vision, mp3, video, etc analysis and summarization to feed into the writing pipeline
 
 
 # =============================================================================
@@ -68,6 +70,9 @@ def get_script_directory() -> Path:
     except NameError:
         return Path.cwd()
 
+# Test mode actually works better
+TEST_MODE = True  # Set to True to use DDGS + trafilatura instead of Tavily
+llm_model = "gpt-5-mini"  # Default LLM model to use, might be able to get away with including a url somewhere and 
 
 # Directories relative to where the script lives
 SCRIPT_DIR = get_script_directory()
@@ -302,7 +307,7 @@ llm = create_llm()
 
 def stream_with_continuation(
     messages: list,
-    max_continuations: int = 5,
+    max_continuations: int = 7,
     continuation_prompt: str = "Continue from where you left off. Do not repeat what you've already written."
 ) -> tuple[str, str]:
     """
@@ -472,35 +477,69 @@ def call_tavily_single(query: str) -> str:
     return response.get("answer", "No answer returned")
 
 
-def call_ddgs_single(query: str, max_results: int = 8) -> str:
+def call_ddgs_single(query: str, max_results: int = 5) -> str:
     """
-    Make a single DuckDuckGo search API call (unofficial, free).
+    Search with DDGS for URLs, then extract full content using trafilatura.
     
     Args:
         query: The search query
-        max_results: Number of results to fetch
+        max_results: Number of results to fetch and extract
         
     Returns:
-        Combined text from search results
+        Combined extracted content from search result pages
     """
     try:
+        # Step 1: Get URLs from DDGS
         results = DDGS().text(query, max_results=max_results)
         
         if not results:
-            return "No results found"
+            return "No search results found"
         
-        # Combine results into a formatted string
+        # Step 2: Extract full content from each URL using trafilatura
         combined = []
-        for i, result in enumerate(results, 1):
-            title = result.get('title', 'No title')
-            body = result.get('body', 'No content')
-            href = result.get('href', '')
-            combined.append(f"**{title}**\n{body}\nSource: {href}")
+        successful_extractions = 0
         
-        return "\n\n---\n\n".join(combined)
+        for result in results:
+            title = result.get('title', 'No title')
+            href = result.get('href', '')
+            
+            if not href:
+                continue
+                
+            try:
+                # Fetch the page
+                downloaded = trafilatura.fetch_url(href)
+                
+                if downloaded:
+                    # Extract content with tables included
+                    content = trafilatura.extract(
+                        downloaded,
+                        include_tables=True,
+                        include_comments=False,
+                        include_images=False,  # Just URLs, not useful without vision
+                        favor_recall=True,  # Get more content
+                        deduplicate=True
+                    )
+                    
+                    if content and len(content.strip()) > 100:
+                        # Truncate if extremely long (keep ~4000 chars per source)
+                        if len(content) > 4000:
+                            content = content[:4000] + "\n\n[Content truncated...]"
+                        
+                        combined.append(f"## {title}\n**Source:** {href}\n\n{content}")
+                        successful_extractions += 1
+                        
+            except Exception as e:
+                # Skip failed extractions silently, continue with others
+                continue
+        
+        if not combined:
+            return "No content could be extracted from search results"
+        
+        return f"*Extracted content from {successful_extractions} sources:*\n\n" + "\n\n---\n\n".join(combined)
         
     except Exception as e:
-        return f"DDGS search error: {str(e)}"
+        return f"DDGS/trafilatura error: {str(e)}"
 
 
 def call_web_single(query: str) -> str:
@@ -538,7 +577,7 @@ def call_web_for_context_multipart(topic: str, is_time_sensitive: bool, current_
     query_parts = break_query_into_parts(topic, current_date_str)
     
     # Determine search provider
-    search_provider = "DDGS (Test Mode)" if TEST_MODE else "Tavily"
+    search_provider = "DDGS + trafilatura (Test Mode)" if TEST_MODE else "Tavily"
     
     # Step 2: Save the breakdown plan
     breakdown_summary = f"""# Query Breakdown Plan
@@ -1169,7 +1208,7 @@ def run_writing_assistant(
     print(f"🆕 Multi-Part Web Search: ENABLED (up to 10 sub-queries)")
     print(f"🆕 External Prompts: ENABLED")
     if TEST_MODE:
-        print(f"🧪 TEST MODE: ENABLED (using DDGS instead of Tavily)")
+        print(f"🧪 TEST MODE: ENABLED (using DDGS + trafilatura instead of Tavily)")
     else:
         print(f"🌐 Search Provider: Tavily")
     
@@ -1197,7 +1236,7 @@ def run_writing_assistant(
     initial_state = WritingState(topic=topic, job_id=JOB_ID)
     
     # Save initial state info
-    search_provider = "DDGS (Test Mode)" if TEST_MODE else "Tavily"
+    search_provider = "DDGS + trafilatura (Test Mode)" if TEST_MODE else "Tavily"
     job_info = f"""# Job Info
 
 - **Job ID:** {JOB_ID}
