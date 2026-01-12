@@ -4,6 +4,9 @@
 
 This demonstrates the user of some really basic langgraph "agents".  The advanced version does web pulling to add context, more relevant information (see below).  It runs in your IDE's terminal window or can be called by another process with the prompt being passed in as the first parameter.
 
+A video explaining this Repo and a demo running the advanced features can be found here-
+<https://www.youtube.com/watch?v=G-Lrn0Li60U>
+
 ## Requirements
 
 In order to use this-
@@ -19,7 +22,7 @@ In order to use this-
     .venv\scripts\activate (or do / if linux/mac)
 4) With your virtual environment active, install the requirements (if you don't have the .venv active, you will install all the requirements globally, don't do that)
     uv pip install -r requirements.txt
-5) You can then run the script out of the IDE or typeing run and the script name into the termainal.
+5) You can then run the script out of the IDE or typing run and the script name into the termainal.
 
 ## Two langgraph examples included-
 

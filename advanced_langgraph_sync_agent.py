@@ -73,6 +73,7 @@ def get_script_directory() -> Path:
 # Test mode actually works better
 TEST_MODE = True  # Set to True to use DDGS + trafilatura instead of Tavily
 llm_model = "gpt-5-mini"  # Default LLM model to use, might be able to get away with including a url somewhere and 
+JOB_ID: str = "" # Global job ID - set at runtime
 
 # Directories relative to where the script lives
 SCRIPT_DIR = get_script_directory()
@@ -91,19 +92,11 @@ print(f"📁 Output directory: {OUTPUT_DIR}")
 print(f"📁 Prompts directory: {PROMPTS_DIR}")
 
 
-# =============================================================================
-# Job ID Management
-# =============================================================================
-
 def generate_job_id() -> str:
     """Generate a unique job ID for this run."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     short_uuid = uuid.uuid4().hex[:8]
     return f"{timestamp}_{short_uuid}"
-
-
-# Global job ID - set at runtime
-JOB_ID: str = ""
 
 
 # =============================================================================
@@ -138,7 +131,6 @@ def load_prompt(prompt_name: str, **kwargs) -> str:
     
     return prompt_text
 
-
 def load_prompt_safe(prompt_name: str, fallback: str = "", **kwargs) -> str:
     """
     Load a prompt from the prompts directory with a fallback.
@@ -166,11 +158,9 @@ def get_working_filepath(agent_name: str) -> Path:
     """Get the filepath for an agent's output in the working directory."""
     return WORKING_DIR / f"{JOB_ID}_{agent_name}.md"
 
-
 def get_output_filepath(filename: str) -> Path:
     """Get the filepath for final output."""
     return OUTPUT_DIR / f"{JOB_ID}_{filename}"
-
 
 def save_to_working(agent_name: str, content: str) -> Path:
     """
@@ -188,7 +178,6 @@ def save_to_working(agent_name: str, content: str) -> Path:
     print(f"   💾 Saved to: {filepath}")
     return filepath
 
-
 def load_from_working(agent_name: str) -> str:
     """
     Load content from the working directory.
@@ -203,7 +192,6 @@ def load_from_working(agent_name: str) -> str:
     if filepath.exists():
         return filepath.read_text(encoding="utf-8")
     return ""
-
 
 def save_final_output(content: str, filename: str = "final_article.md") -> Path:
     """
@@ -220,12 +208,10 @@ def save_final_output(content: str, filename: str = "final_article.md") -> Path:
     filepath.write_text(content, encoding="utf-8")
     return filepath
 
-
 def append_to_file(filepath: Path, content: str) -> None:
     """Append content to an existing file."""
     with open(filepath, "a", encoding="utf-8") as f:
         f.write(content)
-
 
 def append_user_prompt(topic: str) -> Path:
     """
@@ -370,7 +356,6 @@ def stream_with_continuation(
     
     return full_response, finish_reason
 
-
 # =============================================================================
 # Retry Decorator for API Resilience
 # =============================================================================
@@ -388,7 +373,6 @@ def with_retries(func):
     def wrapper(*args, **kwargs):
         return func(*args, **kwargs)
     return wrapper
-
 
 # =============================================================================
 # Multi-Part Query Breaking (NEW)
@@ -457,7 +441,6 @@ def break_query_into_parts(topic: str, current_date_str: str) -> list[dict]:
         print(f"   ⚠️  Query breakdown failed ({e}), using single query")
         return [{'part_name': 'Main Query', 'query': topic}]
 
-
 def call_tavily_single(query: str) -> str:
     """
     Make a single Tavily API call.
@@ -475,8 +458,6 @@ def call_tavily_single(query: str) -> str:
         search_depth="advanced"
     )   
     return response.get("answer", "No answer returned")
-
-
 def call_ddgs_single(query: str, max_results: int = 5) -> str:
     """
     Search with DDGS for URLs, then extract full content using trafilatura.
@@ -662,14 +643,14 @@ def call_web_for_context_multipart(topic: str, is_time_sensitive: bool, current_
 """
     
     # Step 5: Save individual results to separate file
-    individual_results_content = "# Individual Tavily Results\n\n"
+    individual_results_content = f"# Individual {search_provider} Results\n\n"
     for i, r in enumerate(all_results, 1):
         individual_results_content += f"---\n\n## Part {i}: {r['part_name']}\n\n"
         individual_results_content += f"**Query:** {r['query']}\n\n"
         individual_results_content += f"**Characters:** {r['char_count']}\n\n"
         individual_results_content += f"### Result:\n\n{r['result']}\n\n"
     
-    save_to_working("tavily_individual_results", individual_results_content)
+    save_to_working("web_individual_results", individual_results_content)
     
     return combined_context, breakdown_summary
 
