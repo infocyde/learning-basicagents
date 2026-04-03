@@ -73,6 +73,13 @@ def get_script_directory() -> Path:
 # Test mode actually works better
 TEST_MODE = True  # Set to True to use DDGS + trafilatura instead of Tavily
 llm_model = "gpt-5-mini"  # Default LLM model to use, might be able to get away with including a url somewhere and 
+# Max chars each agent should read from files to avoid overloading LLM context window  (15000 is pretty high, I think tavily answers are capped at ~2000 words or ~8000 chars)
+# smaller local llms you might have to cap lower.
+max_chars_per_agent = 6000  
+max_ddg_results = 10  # Number of DDGS results to fetch when in TEST_MODE gpt 5 mini can handle about 128000 tokens in context window so we can go a bit higher here
+
+# Todo: Make max_chars_per_agent dynamic based on model context window size, leaving room for outline being sent with web context etc.
+
 JOB_ID: str = "" # Global job ID - set at runtime
 
 # Directories relative to where the script lives
@@ -458,7 +465,7 @@ def call_tavily_single(query: str) -> str:
         search_depth="advanced"
     )   
     return response.get("answer", "No answer returned")
-def call_ddgs_single(query: str, max_results: int = 5) -> str:
+def call_ddgs_single(query: str, max_results: int = 10) -> str:
     """
     Search with DDGS for URLs, then extract full content using trafilatura.
     
@@ -503,9 +510,9 @@ def call_ddgs_single(query: str, max_results: int = 5) -> str:
                     )
                     
                     if content and len(content.strip()) > 100:
-                        # Truncate if extremely long (keep ~4000 chars per source)
-                        if len(content) > 4000:
-                            content = content[:4000] + "\n\n[Content truncated...]"
+                        # Truncate if necessary
+                        if len(content) > max_chars_per_agent:
+                            content = content[:max_chars_per_agent] + "\n\n[Content truncated...]"
                         
                         combined.append(f"## {title}\n**Source:** {href}\n\n{content}")
                         successful_extractions += 1

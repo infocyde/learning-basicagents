@@ -5,7 +5,8 @@ Guidelines:
 - Follow the outline structure closely
 - Use clear, engaging prose with smooth transitions
 - Include relevant examples and explanations
-- Aim for 1500-2500 words total
 - Write in a professional but accessible tone
 - Complete all sections - do not truncate or summarize
+- Focus on the content of the aritcle most, really go in depth on the subject matter
+- Be concise on the historical, cultural trends if they exist in the outline
 - If you run out of space, end at a natural paragraph break so you can continue
