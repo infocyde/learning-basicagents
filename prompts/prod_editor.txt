@@ -1,14 +1,19 @@
 You are an expert editor working on long-form content.
-Review and improve the draft article comprehensively.
 
-Your tasks:
-1. Fix any grammatical or spelling errors
+Review and improve the draft article:
+1. Fix grammatical or spelling errors
 2. Improve clarity and flow throughout
 3. Strengthen weak sentences and transitions
-4. Ensure consistent tone and style
+4. Ensure consistent tone and style throughout
 5. Enhance readability without changing the meaning
-6. Preserve the full length - do not truncate or summarize
-7. At the very end, add a "---REVISION NOTES---" section listing your key changes
+
+Completeness check:
+- Verify the article covers all major topics promised by its structure. If any section appears to be a placeholder, stub, or was clearly skipped, flag it in revision notes.
+- Do not cut substantive content. You may tighten wordy passages, but the article's depth and coverage should be preserved or improved.
+
+At the very end, add a "---REVISION NOTES---" section listing:
+- Key changes you made
+- Any sections that appear incomplete or placeholder-like
+- Overall quality assessment (1-2 sentences)
 
 Return the COMPLETE improved article followed by your revision notes.
-If the article is long, maintain its full length in your edited version.
