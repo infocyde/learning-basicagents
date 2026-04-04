@@ -77,8 +77,8 @@ def get_script_directory() -> Path:
 TEST_MODE = True  # Set to True to use DDGS + trafilatura instead of Tavily
 llm_model = "google_gemma-4-e4b-it"  # Default LLM model to use
 llm_temperature = 0.9  # Creativity level (0.0 = deterministic, 1.0 = creative)
-context_window_tokens = 130000  # Your model's context window size in tokens (check model spec)
-chars_per_token = 4  # Conservative estimate (typical range: 2-4 chars per token)
+context_window_tokens = 32000  # Your model's context window size in tokens (check model spec)
+chars_per_token = 3  # Conservative estimate (3 is safer for structured/markdown content)
 use_draft_as_final = True  # Set to True to skip the editor agent and use the draft as the final article
 force_web_search = False  # Set to True to always search the web, overriding the LLM's analysis (useful for smaller models)
 max_parallel_summarizations = 1  # Number of chunk summarization calls to run in parallel. Recommend 1 unless you have GPU headroom or use a remote LLM.
@@ -95,9 +95,9 @@ RESEARCH_LEVELS = {
 DEFAULT_RESEARCH_LEVEL = "1"
 
 SOURCE_LEVELS = {
-    "1": {"name": "Few",     "results_per_query": 3, "description": "3 sources per sub-query — fast, focused"},
-    "2": {"name": "Average", "results_per_query": 5, "description": "5 sources per sub-query — balanced coverage"},
-    "3": {"name": "Many",    "results_per_query": 10, "description": "10 sources per sub-query — comprehensive, slower"},
+    "1": {"name": "Few",     "results_per_query": 2, "description": "2 sources per sub-query — fast, focused"},
+    "2": {"name": "Average", "results_per_query": 4, "description": "4 sources per sub-query — balanced coverage"},
+    "3": {"name": "Many",    "results_per_query": 7, "description": "7 sources per sub-query — comprehensive, slower"},
 }
 DEFAULT_SOURCE_LEVEL = "2"
 
@@ -358,12 +358,13 @@ Timestamp: {timestamp}
 
 WRITING_STYLES = {
     "1": {
-        "name": "Technical Report",
-        "description": "Formal, precise, data-driven. Uses structured sections, citations, and objective tone.",
+        "name": "Technical / Factual",
+        "description": "Precise, factual, well-structured. Focuses on accuracy and clarity without bureaucratic language.",
         "prompt_instruction": (
-            "Write in a formal, technical style. Use precise language, structured sections with clear headings, "
-            "data-driven arguments, objective tone, and cite sources where available. "
-            "Avoid colloquialisms and casual language. Target audience: professionals and subject-matter experts."
+            "Write in a precise, factual style. Use clear structured sections, specific data and numbers, "
+            "and an objective tone. Be direct — state facts plainly without inflating language. "
+            "Say 'two US aircraft were shot down' not 'kinetic asset neutralization events were documented.' "
+            "Cite sources where available. Target audience: informed readers who want accurate, well-organized information."
         )
     },
     "2": {
@@ -382,6 +383,17 @@ WRITING_STYLES = {
             "Write in a narrative, story-driven style. Weave facts and information into compelling narrative arcs "
             "with vivid descriptions, character perspectives where appropriate, and dramatic structure. "
             "Use creative language and immersive storytelling techniques. Target audience: readers who enjoy long-form narrative."
+        )
+    },
+    "4": {
+        "name": "News Briefing",
+        "description": "Concise, factual, inverted pyramid. Leads with the biggest developments, no fluff.",
+        "prompt_instruction": (
+            "Write as a news briefing. Use inverted pyramid structure — lead with the most significant developments first, "
+            "then provide supporting details and context. Be concise and factual. Every sentence should deliver information. "
+            "No filler introductions, no dramatic buildup, no conclusions that just restate what was said. "
+            "Use short paragraphs. State numbers, names, and specifics directly. "
+            "Target audience: someone who wants to get caught up quickly."
         )
     },
 }
@@ -445,67 +457,72 @@ llm = create_llm()
 
 def stream_with_continuation(
     messages: list,
-    max_continuations: int = 7,
+    max_continuations: int = 3,
     continuation_prompt: str = "Continue from where you left off. Do not repeat what you've already written."
 ) -> tuple[str, str]:
     """
     Stream LLM response with automatic continuation if response is truncated.
-    
+
+    Only continues when the server explicitly signals truncation via finish_reason='length'.
+    Uses a sliding window approach to prevent context explosion on continuations.
+
     Args:
         messages: Initial messages to send
-        max_continuations: Maximum number of continuation calls
+        max_continuations: Maximum number of continuation calls (default 3)
         continuation_prompt: Prompt to use for continuations
-        
+
     Returns:
         Tuple of (full_response, finish_reason)
     """
     full_response = ""
     finish_reason = "unknown"
-    conversation = list(messages)  # Copy to avoid mutation
-    
+    # Keep only the original messages for continuations (system + user)
+    original_messages = list(messages)
+
     for iteration in range(max_continuations + 1):
         chunk_text = ""
         current_finish_reason = None
-        
+
+        # Build conversation for this iteration
+        if iteration == 0:
+            conversation = list(original_messages)
+        else:
+            # Sliding window: original messages + summary of what's written + continue prompt
+            # Only include the tail of what we've written to avoid bloating context
+            tail_chars = min(len(full_response), context_window_chars // 6)
+            written_so_far = full_response[-tail_chars:]
+            conversation = list(original_messages)
+            conversation.append(AIMessage(content=f"[Partial response so far, showing last portion:]\n\n{written_so_far}"))
+            conversation.append(HumanMessage(content=continuation_prompt))
+
         # Stream the response
         for chunk in llm.stream(conversation):
             if chunk.content:
                 chunk_text += chunk.content
                 print(".", end="", flush=True)
-            
+
             # Try to get finish reason from chunk metadata
             if hasattr(chunk, 'response_metadata'):
                 metadata = chunk.response_metadata
                 if isinstance(metadata, dict) and 'finish_reason' in metadata:
                     current_finish_reason = metadata['finish_reason']
-        
+
         full_response += chunk_text
-        
+
         # Check if we got a complete response
-        # OpenAI returns 'stop' when complete, 'length' when truncated
+        # Only continue if the server explicitly says it was truncated due to length
         if current_finish_reason:
             finish_reason = current_finish_reason
-        
-        # Heuristic checks for incomplete response
-        response_seems_incomplete = (
-            finish_reason == "length" or
-            chunk_text.rstrip().endswith(("...", "—", "-", ",")) or
-            (len(chunk_text) > 100 and not chunk_text.rstrip().endswith((".", "!", "?", '"', "'")))
-        )
-        
-        if not response_seems_incomplete:
-            # Response appears complete
+
+        if finish_reason != "length":
+            # Response is complete (got 'stop', 'unknown', or anything else)
             break
-        
+
         if iteration < max_continuations:
-            print(f"\n   🔄 Response may be incomplete, continuing (attempt {iteration + 2})...", end="", flush=True)
-            
-            # Add the partial response and continuation request to conversation
-            conversation.append(AIMessage(content=chunk_text))
-            conversation.append(HumanMessage(content=continuation_prompt))
+            print(f"\n   🔄 Response truncated by token limit, continuing (attempt {iteration + 2})...", end="", flush=True)
         else:
-            print(f"\n   ⚠️  Max continuations reached")
-    
+            print(f"\n   ⚠️  Max continuations reached ({max_continuations})")
+
     return full_response, finish_reason
 
 
@@ -693,24 +710,25 @@ def with_retries(func):
 # Multi-Part Query Breaking (NEW)
 # =============================================================================
 
-def break_query_into_parts(topic: str, current_date_str: str) -> list[dict]:
+def break_query_into_parts(topic: str, current_date_str: str, complexity: str = "moderate") -> list[dict]:
     """
     Use LLM to break a complex query into multiple focused sub-queries.
-    
+
     Each sub-query targets a different aspect of the topic to maximize
     the information gathered from Tavily's ~2000 word limit per call.
-    
+
     Args:
         topic: The main topic/query to break down
         current_date_str: Current date string for context
-        
+        complexity: Topic complexity from analysis step ("simple", "moderate", "complex")
+
     Returns:
         List of dicts with 'part_name' and 'query' keys
     """
     print("   🔧 Breaking query into focused sub-parts...")
-    
+
     # Load prompt from file
-    system_prompt = load_prompt("prod_query_breakdown", current_date_str=current_date_str)
+    system_prompt = load_prompt("prod_query_breakdown", current_date_str=current_date_str, complexity=complexity)
     
     messages = [
         SystemMessage(content=system_prompt),
@@ -854,23 +872,24 @@ def call_web_single(query: str) -> str:
         return call_tavily_single(query)
 
 
-def call_web_for_context_multipart(topic: str, is_time_sensitive: bool, current_date_str: str) -> tuple[str, str]:
+def call_web_for_context_multipart(topic: str, is_time_sensitive: bool, current_date_str: str, complexity: str = "moderate") -> tuple[str, str]:
     """
     Fetch web context using multiple search calls for comprehensive coverage.
-    
+
     Breaks the topic into multiple sub-queries, executes each separately,
     and combines the results. Uses Tavily or DDGS based on TEST_MODE.
-    
+
     Args:
         topic: The main topic/query
         is_time_sensitive: Whether to add date context to queries
         current_date_str: Current date string
-        
+        complexity: Topic complexity from analysis step
+
     Returns:
         Tuple of (combined_context, breakdown_summary)
     """
     # Step 1: Break query into parts
-    query_parts = break_query_into_parts(topic, current_date_str)
+    query_parts = break_query_into_parts(topic, current_date_str, complexity=complexity)
     
     # Determine search provider
     search_provider = "DDGS + trafilatura (Test Mode)" if TEST_MODE else "Tavily"
@@ -1069,7 +1088,8 @@ def extra_context_agent(state: WritingState) -> dict:
                 combined_context, breakdown_summary = call_web_for_context_multipart(
                     topic=state.topic,
                     is_time_sensitive=is_time_sensitive,
-                    current_date_str=current_date_str
+                    current_date_str=current_date_str,
+                    complexity=complexity
                 )
                 
                 # Save the breakdown plan
@@ -1214,38 +1234,39 @@ def writing_agent(state: WritingState) -> dict:
     if not outline:
         return {"error": "Writing agent failed: Could not load outline from file"}
     
-    # Check for web context
-    web_context, has_web_context = load_working_if_usable("web_context", [STATUS_NO_CONTEXT, STATUS_FAILED])
+    # Load web research — prefer individual results (more structured) over combined web_context
+    # Both contain the same underlying data, so we only use one to avoid redundant summarization
+    web_context, has_web_context = load_working_if_usable("web_individual_results", [STATUS_FAILED])
+    if not has_web_context:
+        # Fall back to combined web_context if individual results aren't available
+        web_context, has_web_context = load_working_if_usable("web_context", [STATUS_NO_CONTEXT, STATUS_FAILED])
 
-    # Also load individual results for more detailed reference
-    individual_results, has_individual_results = load_working_if_usable("web_individual_results", [STATUS_FAILED])
-    
     print("\n✍️  WRITING AGENT")
     print(f"   Job ID: {JOB_ID}")
     print(f"   Loaded outline ({len(outline)} chars) from file")
 
-    # Chunk and summarize each content piece if it exceeds context window
-    outline = chunk_and_summarize(outline, "article outline for writing the draft")
+    # Budget: reserve half the context window for output + system prompt + continuations
+    content_budget = context_window_chars // 2
+
+    if has_web_context:
+        # Split budget: outline 30%, web research 70%
+        outline_budget = content_budget * 3 // 10
+        web_budget = content_budget * 7 // 10
+        print(f"   📊 Content budget: {content_budget} chars (outline: {outline_budget}, web: {web_budget})")
+    else:
+        # No web research — outline gets the full budget
+        outline_budget = content_budget
+        print(f"   📊 Content budget: {content_budget} chars (all for outline, no web research)")
+
+    # Chunk and summarize each content piece to fit its budget
+    outline = chunk_and_summarize(outline, "article outline for writing the draft", max_chars=outline_budget)
     print(f"   📋 Outline after processing: {len(outline)} chars")
 
     if has_web_context:
-        print(f"   📚 Loading web context from file ({len(web_context)} chars)")
-        web_context = chunk_and_summarize(web_context, "web research context for article writing")
-        print(f"   📚 Web context after processing: {len(web_context)} chars")
-
-    if has_individual_results:
         search_label = "DDGS/trafilatura" if TEST_MODE else "Tavily"
-        print(f"   📑 Loading individual {search_label} results ({len(individual_results)} chars)")
-        individual_results = chunk_and_summarize(individual_results, "detailed web research results for article writing")
-        print(f"   📑 Individual results after processing: {len(individual_results)} chars")
-
-    # Final check: if all content combined still exceeds limit, prioritize outline + web_context
-    total_content = len(outline) + (len(web_context) if has_web_context else 0) + (len(individual_results) if has_individual_results else 0)
-    content_limit = context_window_chars - prompt_reserve_chars
-    if total_content > content_limit and has_individual_results:
-        print(f"   ⚠️  Combined content ({total_content} chars) still exceeds limit, dropping individual results")
-        individual_results = ""
-        has_individual_results = False
+        print(f"   📚 Loading web research ({len(web_context)} chars)")
+        web_context = chunk_and_summarize(web_context, "web research context for article writing", max_chars=web_budget)
+        print(f"   📚 Web research after processing: {len(web_context)} chars")
 
     print("   Writing...", end="", flush=True)
     
@@ -1271,10 +1292,11 @@ Cite sources naturally where appropriate (e.g., "According to recent studies..."
         
         if has_web_context:
             user_content += f"\n\n## Web Research Context (use this for accurate, current information)\n\n{web_context}"
-        
-        # If we have detailed individual results and they're not too long, include them too
-        if has_individual_results and len(individual_results) < max_individual_results_chars:
-            user_content += f"\n\n## Detailed Research Results (additional context)\n\n{individual_results}"
+
+        # Include reference list so the writer can attribute facts to sources
+        if _collected_references:
+            ref_list = "\n".join(f"- {ref['title']} — {ref['url']}" for ref in _collected_references)
+            user_content += f"\n\n## Source Reference List (for attribution of high-impact facts)\n\n{ref_list}"
 
         messages = [
             SystemMessage(content=system_prompt),
@@ -1284,7 +1306,7 @@ Cite sources naturally where appropriate (e.g., "According to recent studies..."
         # Stream with continuation support for long articles
         full_response, finish_reason = stream_with_continuation(
             messages, 
-            max_continuations=8,
+            max_continuations=3,
             continuation_prompt="Continue writing the article from exactly where you stopped. Do not repeat any content. Pick up mid-section if needed."
         )
         
@@ -1348,7 +1370,7 @@ def editor_agent(state: WritingState) -> dict:
         # Stream with continuation support
         full_response, finish_reason = stream_with_continuation(
             messages,
-            max_continuations=8,
+            max_continuations=3,
             continuation_prompt="Continue the edited article from exactly where you stopped. Do not repeat content. Complete all remaining sections and then add the revision notes at the end."
         )
         
